@@ -34,6 +34,7 @@ import importlib.util
 import os
 import re
 import shutil
+import struct
 import sys
 import time
 from pathlib import Path
@@ -438,6 +439,126 @@ def patch(mod: ModuleType, repo: Path, *, j: int | None = None) -> None:
     mod.capture_jit = capture_jit
 
     # ---------------------------------------------------------------- Unreal inline shaders
+    pg = getattr(mod, 'pg', None)
+    if pg is None:
+        for sub in ('tools', 'games'):
+            d = str(Path(repo) / 'dm' / sub)
+            if d not in sys.path:
+                sys.path.insert(0, d)
+        try:
+            import importlib
+            pg = importlib.import_module('profile_guess')
+            mod.pg = pg
+        except Exception:
+            pg = None
+
+    if pg is not None:
+        if not hasattr(pg, '_nspb_orig_build_sources') and hasattr(pg, 'build_sources'):
+            pg._nspb_orig_build_sources = pg.build_sources
+        if hasattr(pg, '_nspb_orig_build_sources'):
+            _orig_build_sources = pg._nspb_orig_build_sources
+
+            def build_sources(exefs, romfs, modules=('main',), *a, **kw):
+                res = _orig_build_sources(exefs, romfs, modules, *a, **kw)
+                if isinstance(res, dict) and 'oodle_packs' in res:
+                    cache = getattr(mod, '_nspb_build_sources_oodle', None)
+                    if not isinstance(cache, dict):
+                        cache = {}
+                        mod._nspb_build_sources_oodle = cache
+                    cache[str(romfs)] = bool(res['oodle_packs'][0])
+                return res
+
+            pg.build_sources = build_sources
+
+    def _scan_romfs_oodle_packs(pg_mod, repo_: Path, romfs) -> bool:
+        """Check whether `romfs` contains non-Unreal Oodle archives (`oodle_packs` in `profile_guess.py`)."""
+        r_os = getattr(pg_mod, 'os', os)
+        r_open = getattr(pg_mod, 'open', open)
+        r_Path = getattr(pg_mod, 'Path', Path)
+        ue3_tag = getattr(pg_mod, 'UE3_TAG', bytes.fromhex('c1832a9e'))
+        rp = r_Path(romfs)
+        if not rp.exists():
+            return False
+        for d, _, names in r_os.walk(rp):
+            for n in names:
+                ext = os.path.splitext(n)[1].lower()
+                p = r_Path(d) / n
+                try:
+                    if ext == '.trpfs':
+                        with r_open(p, 'rb') as f:
+                            if f.read(8) == b'ONEPACK\0':
+                                return True
+                    elif ext == '.pkz':
+                        with r_open(p, 'rb') as f:
+                            hdr = f.read(0x40)
+                            if len(hdr) >= 0x20 and hdr[:4] == b'pkzl':
+                                _, sz, cnt, _, name_off = struct.unpack_from('<IIQQQ', hdr, 8)
+                                if cnt and sz <= 1 << 30 and 0x20 <= name_off < sz:
+                                    f.seek(int(name_off))
+                                    if b'OodleKraken\0' in f.read(min(int(sz - name_off), 1 << 20)):
+                                        return True
+                    elif ext == '.gfpak':
+                        with r_open(p, 'rb') as f:
+                            hdr = f.read(0x48)
+                            if len(hdr) >= 0x18 and hdr[:8] == b'GFLXPACK':
+                                cnt, ptr_off = struct.unpack_from('<II', hdr, 0x10)
+                                if cnt and ptr_off + cnt * 8 < (1 << 24):
+                                    f.seek(int(ptr_off + cnt * 8))
+                                    ent = f.read(0x18)
+                                    if len(ent) >= 5 and ent[4] == 3:
+                                        return True
+                    elif ext in ('.upk', '.u', '.xxx', '.umap', '.sfc'):
+                        with r_open(p, 'rb') as f:
+                            b = f.read(256)
+                        if len(b) >= 24 and b[:4] == ue3_tag:
+                            ver = struct.unpack_from('<H', b, 4)[0]
+                            pos = 12 if ver >= 249 else 8
+                            if pos + 4 <= len(b):
+                                nlen = struct.unpack_from('<i', b, pos)[0]
+                                pos += 4 + (-nlen * 2 if nlen < 0 else nlen)
+                                if 12 <= pos <= len(b) - 104:
+                                    flags, = struct.unpack_from('<I', b, pos)
+                                    pos += (40 if ver >= 277 else 36) + (16 if ver >= 516 else 0)
+                                    pos += (20 if ver >= 584 else 4 if ver >= 536 else 0) + (8 if ver >= 655 else 4)
+                                    if (flags & 0x02000000) and pos + 8 <= len(b):
+                                        comp, ccnt = struct.unpack_from('<II', b, pos)
+                                        if comp == 0x8c and 0 < ccnt <= 1 << 16:
+                                            return True
+                except Exception:
+                    continue
+        gfx_tools = str(Path(repo_) / 'dm' / 'gfx' / 'tools')
+        if gfx_tools not in sys.path:
+            sys.path.insert(0, gfx_tools)
+        try:
+            import frostbite
+            if frostbite.is_frostbite(str(romfs)):
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _rom_has_oodle_packs(pg_mod, repo_: Path, romfs, main_path) -> bool:
+        if pg_mod is not None and callable(getattr(pg_mod, 'oodle_packs', None)):
+            return bool(pg_mod.oodle_packs(romfs)[0])
+        if pg_mod is not None and main_path is not None and callable(getattr(pg_mod, 'build_sources', None)):
+            mp = Path(main_path)
+            if mp.is_file():
+                try:
+                    with open(mp, 'rb') as f:
+                        is_nso = f.read(4) == b'NSO0'
+                except OSError:
+                    is_nso = False
+                if is_nso:
+                    try:
+                        nso_fn = getattr(pg_mod, 'nso_files', None)
+                        mods = [p.name for p in nso_fn(mp.parent)] if callable(nso_fn) else [mp.name]
+                        res = pg_mod.build_sources(mp.parent, romfs, mods or [mp.name])
+                        if isinstance(res, dict) and 'oodle_packs' in res:
+                            return bool(res['oodle_packs'][0])
+                    except Exception:
+                        pass
+        return _scan_romfs_oodle_packs(pg_mod, repo_, romfs)
+
     if not hasattr(mod, '_nspb_orig_split_shaders') and hasattr(mod, 'split_shaders'):
         mod._nspb_orig_split_shaders = mod.split_shaders
 
@@ -460,19 +581,23 @@ def patch(mod: ModuleType, repo: Path, *, j: int | None = None) -> None:
             tables or cache keys are written.
             """
             if oodle is not None:
-                pg = getattr(mod, 'pg', None)
-                if pg is None:
-                    games_dir = str(Path(repo_) / 'dm' / 'games')
-                    if games_dir not in sys.path:
-                        sys.path.insert(0, games_dir)
-                    try:
-                        import importlib
-                        pg = importlib.import_module('profile_guess')
-                    except Exception:
-                        pg = None
-                has_oodle_packs = pg is not None and any(
-                    pg.oodle_packs(r)[0] for r in roms
-                )
+                cur_pg = getattr(mod, 'pg', None) or pg
+                recorded = dict(getattr(mod, '_nspb_build_sources_oodle', None) or {})
+                mod._nspb_build_sources_oodle = {}
+                if recorded:
+                    has_oodle_packs = (
+                        any(recorded[str(r)] for r in roms if str(r) in recorded)
+                        if any(str(r) in recorded for r in roms)
+                        else any(recorded.values())
+                    )
+                else:
+                    pairs = [
+                        (r, mains[i] if mains and i < len(mains) else None)
+                        for i, r in enumerate(roms)
+                    ]
+                    has_oodle_packs = any(
+                        _rom_has_oodle_packs(cur_pg, Path(repo_), r, m) for r, m in pairs
+                    )
                 if not has_oodle_packs:
                     oodle = None
                     if env.get('DM_EXPERIMENTAL_BUILDER') == '1':
